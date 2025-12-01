@@ -1,0 +1,566 @@
+steps:
+  # Step 0: Clone the public app repo (read-only, never pushes)
+  # This is the KEY step - private repo clones public repo to get app code
+  - name: 'gcr.io/cloud-builders/git'
+    id: 'clone-app-repo'
+    args: ['clone', '--depth', '1', '--branch', 'main',
+           'https://github.com/${_GITHUB_OWNER}/${_APP_REPO}.git',
+           'app']
+
+  # Detect changes (working in cloned app directory)
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: "detect-changes"
+    waitFor: ["clone-app-repo"]
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        # Default to full-build flags
+        echo "true" > /workspace/frontend_changed
+        echo "true" > /workspace/backend_changed
+
+        # Check if bucket exists
+        if ! gcloud storage buckets describe gs://${PROJECT_ID}-build-artifacts --project=${PROJECT_ID} 2>/dev/null; then
+          echo "Creating build artifacts bucket..."
+          gcloud storage buckets create gs://${PROJECT_ID}-build-artifacts --location=${_REGION} --project=${PROJECT_ID}
+        fi
+
+        # Check if hash files exist
+        if ! gcloud storage ls gs://${PROJECT_ID}-build-artifacts/hashes/ &>/dev/null; then
+          echo "No previous hashes found - this is likely the first build"
+          echo "Build decisions: Frontend=true, Backend=true"
+          exit 0
+        fi
+
+        # Calculate current hashes (from cloned app directory)
+        (
+          find app/frontend -type f -print0 | sort -z | xargs -0 sha256sum;
+          sha256sum skaffold-frontend.yaml 2>/dev/null || echo "no-skaffold-frontend"
+        ) | sha256sum > /workspace/frontend-hash-current
+        (
+          find app/backend -type f -print0 | sort -z | xargs -0 sha256sum;
+          sha256sum skaffold-backend.yaml 2>/dev/null || echo "no-skaffold-backend"
+        ) | sha256sum > /workspace/backend-hash-current
+
+        # Shared files/directories hash
+        (
+          sha256sum cloudbuild.yaml 2>/dev/null || echo "no-cloudbuild"
+        ) | sha256sum > /workspace/shared-hash-current
+
+        # Download previous hashes
+        mkdir -p /workspace/prev-hashes
+
+        # Try to download previous hashes, suppressing errors if files don't exist
+        gcloud storage cp gs://${PROJECT_ID}-build-artifacts/hashes/frontend-hash /workspace/prev-hashes/frontend-hash 2>/dev/null || echo "none" > /workspace/prev-hashes/frontend-hash
+        gcloud storage cp gs://${PROJECT_ID}-build-artifacts/hashes/backend-hash /workspace/prev-hashes/backend-hash 2>/dev/null || echo "none" > /workspace/prev-hashes/backend-hash
+        gcloud storage cp gs://${PROJECT_ID}-build-artifacts/hashes/shared-hash /workspace/prev-hashes/shared-hash 2>/dev/null || echo "none" > /workspace/prev-hashes/shared-hash
+
+        # Check for shared file changes
+        SHARED_CHANGED=false
+        if ! cmp -s /workspace/shared-hash-current /workspace/prev-hashes/shared-hash; then
+          echo "Shared files changed - will build both frontend and backend"
+          SHARED_CHANGED=true
+        else
+          echo "No changes detected in shared files"
+        fi
+
+        # Check for frontend changes (only if we're not already building due to shared changes)
+        if [ "$$SHARED_CHANGED" = "false" ] && cmp -s /workspace/frontend-hash-current /workspace/prev-hashes/frontend-hash; then
+          echo "No frontend changes detected"
+          echo "false" > /workspace/frontend_changed
+        else
+          echo "Frontend changes detected or shared files changed"
+        fi
+
+        # Check for backend changes (only if we're not already building due to shared changes)
+        if [ "$$SHARED_CHANGED" = "false" ] && cmp -s /workspace/backend-hash-current /workspace/prev-hashes/backend-hash; then
+          echo "No backend changes detected"
+          echo "false" > /workspace/backend_changed
+        else
+          echo "Backend changes detected or shared files changed"
+        fi
+
+        echo "Build decisions: Frontend=$(cat /workspace/frontend_changed), Backend=$(cat /workspace/backend_changed)"
+
+  # Pull backend cache image
+  - name: "gcr.io/cloud-builders/docker"
+    id: "pull-backend-cache"
+    waitFor: ["detect-changes"]
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        # Pull the latest image to use as cache, ignore errors if it doesn't exist
+        docker pull ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/${_SERVICE_NAME}-backend:latest || exit 0
+
+  # Pull frontend cache image
+  - name: "gcr.io/cloud-builders/docker"
+    id: "pull-frontend-cache"
+    waitFor: ["detect-changes"]
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        # Pull the latest image to use as cache, ignore errors if it doesn't exist
+        docker pull ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/${_SERVICE_NAME}-frontend:latest || exit 0
+
+  # Install frontend dependencies for quality checks (from cloned app)
+  - name: "node:20"
+    id: "install-frontend-deps"
+    waitFor: ["detect-changes"]
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        if [ "$(cat /workspace/frontend_changed)" == "true" ]; then
+          echo "Installing frontend dependencies for quality checks..."
+          cd app/frontend
+          npm ci --prefer-offline --no-audit
+        else
+          echo "Skipping dependency installation - no frontend changes"
+        fi
+
+  # Frontend security audit check (blocking)
+  - name: "node:20"
+    id: "frontend-security-audit"
+    waitFor: ["install-frontend-deps"]
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        if [ "$(cat /workspace/frontend_changed)" == "true" ]; then
+          echo "Running npm audit (blocking on high/critical vulnerabilities)..."
+          cd app/frontend
+          npm audit --audit-level=high
+        else
+          echo "Skipping security audit - no frontend changes"
+        fi
+
+  # Frontend ESLint check (blocking)
+  - name: "node:20"
+    id: "frontend-lint"
+    waitFor: ["install-frontend-deps"]
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        if [ "$(cat /workspace/frontend_changed)" == "true" ]; then
+          echo "Running ESLint..."
+          cd app/frontend
+          npm run lint
+        else
+          echo "Skipping lint check - no frontend changes"
+        fi
+
+  # Frontend TypeScript type check (blocking)
+  - name: "node:20"
+    id: "frontend-type-check"
+    waitFor: ["install-frontend-deps"]
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        if [ "$(cat /workspace/frontend_changed)" == "true" ]; then
+          echo "Running TypeScript type check..."
+          cd app/frontend
+          npm run type-check
+        else
+          echo "Skipping type check - no frontend changes"
+        fi
+
+  # Frontend Prettier format check (blocking, read-only)
+  - name: "node:20"
+    id: "frontend-format-check"
+    waitFor: ["install-frontend-deps"]
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        if [ "$(cat /workspace/frontend_changed)" == "true" ]; then
+          echo "Running Prettier format check..."
+          cd app/frontend
+          npm run format:check
+        else
+          echo "Skipping format check - no frontend changes"
+        fi
+
+  # Build backend image (from cloned app/backend)
+  - name: "gcr.io/cloud-builders/docker"
+    id: "build-backend"
+    waitFor: ["pull-backend-cache"]
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        if [ "$(cat /workspace/backend_changed)" == "true" ]; then
+          # Actually build from cloned app directory
+          docker build \
+            -t ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/${_SERVICE_NAME}-backend:${COMMIT_SHA} \
+            -t ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/${_SERVICE_NAME}-backend:latest \
+            --cache-from ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/${_SERVICE_NAME}-backend:latest \
+            ./app/backend
+        else
+          echo "No backend changes detected, reusing latest image"
+          docker tag \
+            ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/${_SERVICE_NAME}-backend:latest \
+            ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/${_SERVICE_NAME}-backend:${COMMIT_SHA}
+        fi
+
+  # Push backend image
+  - name: "gcr.io/cloud-builders/docker"
+    id: "push-backend"
+    waitFor: ["build-backend"]
+    args:
+      - "push"
+      - "--all-tags"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/${_SERVICE_NAME}-backend"
+
+  # Build frontend image (from cloned app/frontend)
+  - name: "gcr.io/cloud-builders/docker"
+    id: "build-frontend"
+    waitFor:
+      - "pull-frontend-cache"
+      - "frontend-security-audit"
+      - "frontend-lint"
+      - "frontend-type-check"
+      - "frontend-format-check"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        if [ "$(cat /workspace/frontend_changed)" == "true" ]; then
+          # Actually build from cloned app directory
+          docker build \
+            -t ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/${_SERVICE_NAME}-frontend:${COMMIT_SHA} \
+            -t ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/${_SERVICE_NAME}-frontend:latest \
+            --cache-from ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/${_SERVICE_NAME}-frontend:latest \
+            ./app/frontend
+        else
+          echo "No frontend changes detected, reusing latest image"
+          docker tag \
+            ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/${_SERVICE_NAME}-frontend:latest \
+            ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/${_SERVICE_NAME}-frontend:${COMMIT_SHA}
+        fi
+
+  # Push frontend image
+  - name: "gcr.io/cloud-builders/docker"
+    id: "push-frontend"
+    waitFor: ["build-frontend"]
+    args:
+      - "push"
+      - "--all-tags"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/${_SERVICE_NAME}-frontend"
+
+  # Build migration-verify image (for Cloud Deploy verification)
+  - name: "gcr.io/cloud-builders/docker"
+    id: "build-migration-verify"
+    waitFor: ["build-backend"]
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        if [ "$(cat /workspace/backend_changed)" == "true" ]; then
+          # Build migration verify container FROM backend image
+          docker build \
+            -t ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/migration-verify:${COMMIT_SHA} \
+            -t ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/migration-verify:latest \
+            --build-arg BACKEND_IMAGE=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/${_SERVICE_NAME}-backend:${COMMIT_SHA} \
+            -f app/backend/scripts/Dockerfile.migrate \
+            app/backend/scripts
+        else
+          echo "Skipping migration-verify build as no backend changes detected"
+        fi
+
+  # Push migration-verify image
+  - name: "gcr.io/cloud-builders/docker"
+    id: "push-migration-verify"
+    waitFor: ["build-migration-verify"]
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        if [ "$(cat /workspace/backend_changed)" == "true" ]; then
+          docker push --all-tags ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/migration-verify
+        else
+          echo "Skipping migration-verify push as no backend changes detected"
+        fi
+
+  # Extract & sanitize backend manifest for staging
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: extract-backend-staging-yaml
+    waitFor: ["-"]
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+
+        # Verify deployment targets exist first
+        echo "Verifying deployment targets exist..."
+        if ! gcloud deploy targets describe "${_SERVICE_NAME}-staging-backend" --region="${_REGION}" --quiet; then
+          echo "ERROR: Backend staging deployment target does not exist."
+          echo "Please ensure infrastructure is deployed with Terraform before running Cloud Build."
+          exit 1
+        fi
+
+        # Install yq via the "latest" redirect URL
+        curl -sSL \
+          https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 \
+          -o /usr/local/bin/yq
+        chmod +x /usr/local/bin/yq
+
+        # Function to extract and sanitize manifest
+        extract_manifest() {
+          local service_name=$1
+          local output_prefix=$2
+          local image_name=$3
+
+          echo "Describing ${service_name} service..."
+          gcloud run services describe "${service_name}" \
+            --region="${_REGION}" \
+            --format=yaml > "${output_prefix}-full.yaml"
+
+          echo "Removing system metadata and normalizing image..."
+          yq eval '
+            del(
+              .metadata.uid,
+              .metadata.selfLink,
+              .metadata.creationTimestamp,
+              .metadata.generation,
+              .metadata.resourceVersion,
+              .metadata.annotations."deployment.kubernetes.io/revision",
+              .status,
+              .spec.template.metadata.name,
+              .spec.traffic
+            ) |
+            .spec.template.spec.containers[0].image = "'${image_name}'" |
+            .spec.traffic = [{"latestRevision": true, "percent": 100}]
+          ' "${output_prefix}-full.yaml" > "${output_prefix}-filtered.yaml"
+        }
+
+        # Extract backend staging manifest
+        extract_manifest "${_SERVICE_NAME}-staging-backend" "/workspace/staging-backend" "backend"
+
+  # COMMENTED: Production backend extraction not needed for staging-only deployment
+  # - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+  #   id: extract-backend-production-yaml
+  #   waitFor: ["-"]
+  #   entrypoint: "bash"
+  #   args:
+  #     - "-c"
+  #     - |
+  #       # ... production backend extraction ...
+
+  # Extract & sanitize frontend manifest for staging
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: extract-frontend-staging-yaml
+    waitFor: ["-"]
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+
+        # Verify deployment targets exist first
+        echo "Verifying deployment targets exist..."
+        if ! gcloud deploy targets describe "${_SERVICE_NAME}-staging-frontend" --region="${_REGION}" --quiet; then
+          echo "ERROR: Frontend staging deployment target does not exist."
+          echo "Please ensure infrastructure is deployed with Terraform before running Cloud Build."
+          exit 1
+        fi
+
+        # Install yq via the "latest" redirect URL if not already installed
+        if [ ! -f "/usr/local/bin/yq" ]; then
+          curl -sSL \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 \
+            -o /usr/local/bin/yq
+          chmod +x /usr/local/bin/yq
+        fi
+
+        # Function to extract and sanitize manifest
+        extract_manifest() {
+          local service_name=$1
+          local output_prefix=$2
+          local image_name=$3
+
+          echo "Describing ${service_name} service..."
+          gcloud run services describe "${service_name}" \
+            --region="${_REGION}" \
+            --format=yaml > "${output_prefix}-full.yaml"
+
+          echo "Removing system metadata and normalizing image..."
+          yq eval '
+            del(
+              .metadata.uid,
+              .metadata.selfLink,
+              .metadata.creationTimestamp,
+              .metadata.generation,
+              .metadata.resourceVersion,
+              .metadata.annotations."deployment.kubernetes.io/revision",
+              .status,
+              .spec.template.metadata.name,
+              .spec.traffic
+            ) |
+            .spec.template.spec.containers[0].image = "'${image_name}'" |
+            .spec.traffic = [{"latestRevision": true, "percent": 100}]
+          ' "${output_prefix}-full.yaml" > "${output_prefix}-filtered.yaml"
+        }
+
+        # Extract frontend staging manifest
+        extract_manifest "${_SERVICE_NAME}-staging-frontend" "/workspace/staging-frontend" "frontend"
+
+  # COMMENTED: Production frontend extraction not needed for staging-only deployment
+  # - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+  #   id: extract-frontend-production-yaml
+  #   waitFor: ["-"]
+  #   entrypoint: "bash"
+  #   args:
+  #     - "-c"
+  #     - |
+  #       # ... production frontend extraction ...
+
+  # Copy manifests to workspace root for skaffold (staging only)
+  - name: "bash"
+    id: "copy-manifests"
+    entrypoint: "bash"
+    waitFor:
+      - extract-backend-staging-yaml
+      - extract-frontend-staging-yaml
+      # REMOVED: Production extraction dependencies
+    args:
+      - "-c"
+      - |
+        echo "Copying extracted manifests to workspace root for skaffold profiles..."
+
+        # Copy staging filtered manifests only
+        cp /workspace/staging-backend-filtered.yaml ./staging-backend-filtered.yaml
+        cp /workspace/staging-frontend-filtered.yaml ./staging-frontend-filtered.yaml
+
+        # COMMENTED: Production manifests not needed
+        # cp /workspace/production-backend-filtered.yaml ./production-backend-filtered.yaml
+        # cp /workspace/production-frontend-filtered.yaml ./production-frontend-filtered.yaml
+
+        echo "Verifying manifests exist:"
+        ls -la *-filtered.yaml
+
+  # Update skaffold-backend.yaml with dynamic verify image path
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: "update-skaffold-migration-image"
+    entrypoint: "bash"
+    waitFor:
+      - push-migration-verify
+      - copy-manifests
+    args:
+      - "-c"
+      - |
+        if [ "$(cat /workspace/backend_changed)" == "true" ]; then
+          echo "Updating skaffold-backend.yaml with dynamic migration-verify image path..."
+
+          # Install yq for YAML manipulation
+          curl -sSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq
+          chmod +x /usr/local/bin/yq
+
+          # Construct dynamic image path
+          IMAGE_PATH="${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/migration-verify:${COMMIT_SHA}"
+
+          # Update staging profile only (production is commented out)
+          yq eval -i ".profiles[0].verify[0].container.image = \"$$IMAGE_PATH\"" skaffold-backend.yaml
+
+          echo "Updated verify image to: $$IMAGE_PATH"
+        else
+          echo "Skipping skaffold update as no backend changes detected"
+        fi
+
+  # Release backend service to staging only
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: "release-backend"
+    entrypoint: "bash"
+    waitFor:
+      - push-backend
+      - update-skaffold-migration-image
+    args:
+      - "-c"
+      - |
+        # Check if backend changed
+        if [ "$(cat /workspace/backend_changed)" == "true" ]; then
+          # Create 8-digit timestamp (MMDDHHSS)
+          TS=$(date +%m%d%H%S)
+
+          echo "Creating backend release with skaffold profiles (staging only)..."
+          gcloud deploy releases create rel-${SHORT_SHA}-$$TS \
+            --delivery-pipeline=${_SERVICE_NAME}-backend-pipeline \
+            --region=${_REGION} \
+            --to-target=${_SERVICE_NAME}-staging-backend \
+            --annotations=commitId=${COMMIT_SHA} \
+            --skaffold-file=skaffold-backend.yaml \
+            --source=. \
+            --images=backend=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/${_SERVICE_NAME}-backend:${COMMIT_SHA}
+        else
+          echo "Skipping backend release as no changes detected"
+        fi
+
+  # Release frontend service to staging only
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: "release-frontend"
+    entrypoint: "bash"
+    waitFor:
+      - push-frontend
+      - copy-manifests
+    args:
+      - "-c"
+      - |
+        # Check if frontend changed
+        if [ "$(cat /workspace/frontend_changed)" == "true" ]; then
+          # Create 8-digit timestamp (MMDDHHSS)
+          TS=$(date +%m%d%H%S)
+
+          echo "Creating frontend release with skaffold profiles (staging only)..."
+          gcloud deploy releases create rel-${SHORT_SHA}-$$TS \
+            --delivery-pipeline=${_SERVICE_NAME}-frontend-pipeline \
+            --region=${_REGION} \
+            --to-target=${_SERVICE_NAME}-staging-frontend \
+            --annotations=commitId=${COMMIT_SHA} \
+            --skaffold-file=skaffold-frontend.yaml \
+            --source=. \
+            --images=frontend=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/${_SERVICE_NAME}-frontend:${COMMIT_SHA}
+        else
+          echo "Skipping frontend release as no changes detected"
+        fi
+
+  # Hash directories and store in cloud storage
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: "save-directory-hashes"
+    waitFor: ["release-frontend", "release-backend"]
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        # Check if bucket exists, if not create it
+        if ! gcloud storage buckets describe gs://${PROJECT_ID}-build-artifacts --project=${PROJECT_ID} 2>/dev/null; then
+          echo "Creating build artifacts bucket..."
+          gcloud storage buckets create gs://${PROJECT_ID}-build-artifacts --location=${_REGION} --project=${PROJECT_ID}
+        fi
+
+        # Create hashes of key directories and files (from cloned app)
+        (
+          find app/frontend -type f -print0 | sort -z | xargs -0 sha256sum;
+          sha256sum skaffold-frontend.yaml 2>/dev/null || echo "no-skaffold-frontend"
+        ) | sha256sum > /workspace/frontend-hash
+        (
+          find app/backend -type f -print0 | sort -z | xargs -0 sha256sum;
+          sha256sum skaffold-backend.yaml 2>/dev/null || echo "no-skaffold-backend"
+        ) | sha256sum > /workspace/backend-hash
+
+        # Shared files/directories hash (cloudbuild.yaml only - no infra in this repo)
+        (
+          sha256sum cloudbuild.yaml 2>/dev/null || echo "no-cloudbuild"
+        ) | sha256sum > /workspace/shared-hash
+
+        # Upload to Cloud Storage - using the top-level cp command
+        gcloud storage cp /workspace/frontend-hash gs://${PROJECT_ID}-build-artifacts/hashes/frontend-hash
+        gcloud storage cp /workspace/backend-hash gs://${PROJECT_ID}-build-artifacts/hashes/backend-hash
+        gcloud storage cp /workspace/shared-hash gs://${PROJECT_ID}-build-artifacts/hashes/shared-hash
+
+options:
+  dynamic_substitutions: true
+  logging: CLOUD_LOGGING_ONLY

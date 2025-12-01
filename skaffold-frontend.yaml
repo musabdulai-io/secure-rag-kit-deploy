@@ -1,0 +1,16 @@
+apiVersion: skaffold/v4beta7
+kind: Config
+metadata:
+  name: secure-rag-kit-frontend-pipeline
+profiles:
+  - name: staging-frontend
+    manifests:
+      rawYaml:
+        - staging-frontend-filtered.yaml
+  # COMMENTED: Production not needed for staging-only deployment
+  # - name: production-frontend
+  #   manifests:
+  #     rawYaml:
+  #       - production-frontend-filtered.yaml
+deploy:
+  cloudrun: {}

@@ -1,0 +1,28 @@
+apiVersion: skaffold/v4beta7
+kind: Config
+metadata:
+  name: secure-rag-kit-backend-pipeline
+profiles:
+  - name: staging-backend
+    manifests:
+      rawYaml:
+        - staging-backend-filtered.yaml
+    verify:
+      - name: run-migrations
+        container:
+          name: migration-verify
+          image: us-central1-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/migration-verify:${COMMIT_SHA}  # Cloud Build rewrites with project-specific path
+          command: ["bash", "/migrate-verify.sh"]
+  # COMMENTED: Production not needed for staging-only deployment
+  # - name: production-backend
+  #   manifests:
+  #     rawYaml:
+  #       - production-backend-filtered.yaml
+  #   verify:
+  #     - name: run-migrations
+  #       container:
+  #         name: migration-verify
+  #         image: us-central1-docker.pkg.dev/${PROJECT_ID}/${_SERVICE_NAME}-repo/migration-verify:${COMMIT_SHA}
+  #         command: ["bash", "/migrate-verify.sh"]
+deploy:
+  cloudrun: {}

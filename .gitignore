@@ -1,0 +1,18 @@
+# Terraform state (contains sensitive data)
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# Terraform variables (contains secrets like API keys)
+*.tfvars
+!terraform.example.tfvars
+
+# OS files
+.DS_Store
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
