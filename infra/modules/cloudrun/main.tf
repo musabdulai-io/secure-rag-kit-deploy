@@ -23,6 +23,11 @@ resource "google_cloud_run_v2_service" "backend" {
       # image = "${var.region}-docker.pkg.dev/${var.project_id}/${var.service_name}-repo/${var.service_name}-backend:latest"
       image = "gcr.io/google-samples/hello-app:1.0" # Placeholder image
 
+      # Explicit port to match backend PORT=8000
+      ports {
+        container_port = 8000
+      }
+
       # Environment variables from Secret Manager
       dynamic "env" {
         for_each = var.backend_env_vars
@@ -62,7 +67,6 @@ resource "google_cloud_run_v2_service" "backend" {
         }
       }
 
-      # Startup probe - more lenient for slow Redis/DB startup in production
       startup_probe {
         failure_threshold     = 5
         initial_delay_seconds = 30
@@ -74,7 +78,6 @@ resource "google_cloud_run_v2_service" "backend" {
         }
       }
 
-      # Liveness probe - detect unrecoverable failures
       liveness_probe {
         failure_threshold     = 3
         initial_delay_seconds = 0
@@ -120,6 +123,11 @@ resource "google_cloud_run_v2_service" "frontend" {
       # image = "${var.region}-docker.pkg.dev/${var.project_id}/${var.service_name}-repo/${var.service_name}-frontend:latest"
       image = "gcr.io/google-samples/hello-app:1.0" # Placeholder image
 
+      # Explicit port to match frontend PORT=3000
+      ports {
+        container_port = 3000
+      }
+
       # Environment variables from Secret Manager
       dynamic "env" {
         for_each = var.frontend_env_vars
@@ -142,7 +150,6 @@ resource "google_cloud_run_v2_service" "frontend" {
         }
       }
 
-      # Startup probe - frontend should start faster than backend
       startup_probe {
         failure_threshold     = 3
         initial_delay_seconds = 10
@@ -150,11 +157,10 @@ resource "google_cloud_run_v2_service" "frontend" {
         period_seconds        = 5
 
         http_get {
-          path = "/healthcheck"
+          path = "/api/healthcheck"
         }
       }
 
-      # Liveness probe - detect nginx failures
       liveness_probe {
         failure_threshold     = 3
         initial_delay_seconds = 0
@@ -162,7 +168,7 @@ resource "google_cloud_run_v2_service" "frontend" {
         period_seconds        = 30
 
         http_get {
-          path = "/healthcheck"
+          path = "/api/healthcheck"
         }
       }
     }

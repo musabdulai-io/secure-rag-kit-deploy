@@ -62,7 +62,9 @@ resource "google_cloud_run_service" "qdrant" {
 
   metadata {
     annotations = {
-      "run.googleapis.com/ingress" = "internal" # Only accessible from within VPC/project
+      # Changed from "internal" to "all" - Cloud Run without VPC egress can't reach internal services
+      # Security is maintained via IAM: only backend SA has roles/run.invoker on Qdrant
+      "run.googleapis.com/ingress" = "all"
     }
   }
 
