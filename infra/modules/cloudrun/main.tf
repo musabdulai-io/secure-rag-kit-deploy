@@ -157,7 +157,7 @@ resource "google_cloud_run_v2_service" "frontend" {
         period_seconds        = 5
 
         http_get {
-          path = "/api/healthcheck"
+          path = "/"
         }
       }
 
@@ -168,7 +168,7 @@ resource "google_cloud_run_v2_service" "frontend" {
         period_seconds        = 30
 
         http_get {
-          path = "/api/healthcheck"
+          path = "/"
         }
       }
     }
