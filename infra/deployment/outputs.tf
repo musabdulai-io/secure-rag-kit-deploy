@@ -40,7 +40,6 @@ output "staging_qdrant_url" {
 #   value       = module.production_deployment.qdrant_url
 # }
 
-# Summary output for easy reference
 output "deployment_summary" {
   description = "Summary of deployed environments"
   value = {

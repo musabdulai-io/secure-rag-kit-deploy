@@ -41,6 +41,10 @@ staging_env_vars = {
     # Minimal frontend env vars for this demo
     # NEXT_PUBLIC_API_URL is auto-populated
   }
+
+  # Custom domains (optional, uses Cloud Run URL if not set)
+  # backend_custom_domain  = "api.yourdomain.com"
+  # frontend_custom_domain = "yourdomain.com"
 }
 
 # COMMENTED: Production not needed for staging-only deployment

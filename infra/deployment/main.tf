@@ -25,12 +25,12 @@ data "terraform_remote_state" "pipeline" {
 
 # Calculate URLs for staging environment
 locals {
-  staging_backend_url  = "https://${var.service_name}-staging-backend-${var.project_number}.${var.region}.run.app"
-  staging_frontend_url = "https://${var.service_name}-staging-frontend-${var.project_number}.${var.region}.run.app"
+  staging_backend_url  = var.staging_env_vars.backend_custom_domain != "" ? "https://${var.staging_env_vars.backend_custom_domain}" : "https://${var.service_name}-staging-backend-${var.project_number}.${var.region}.run.app"
+  staging_frontend_url = var.staging_env_vars.frontend_custom_domain != "" ? "https://${var.staging_env_vars.frontend_custom_domain}" : "https://${var.service_name}-staging-frontend-${var.project_number}.${var.region}.run.app"
 
   # COMMENTED: Production URLs not needed for staging-only deployment
-  # production_backend_url  = "https://${var.service_name}-production-backend-${var.project_number}.${var.region}.run.app"
-  # production_frontend_url = "https://${var.service_name}-production-frontend-${var.project_number}.${var.region}.run.app"
+  # production_backend_url  = var.production_env_vars.backend_custom_domain != "" ? "https://${var.production_env_vars.backend_custom_domain}" : "https://${var.service_name}-production-backend-${var.project_number}.${var.region}.run.app"
+  # production_frontend_url = var.production_env_vars.frontend_custom_domain != "" ? "https://${var.production_env_vars.frontend_custom_domain}" : "https://${var.service_name}-production-frontend-${var.project_number}.${var.region}.run.app"
 
   # Calculate resource names (to avoid circular dependencies)
   staging_storage_bucket_name = "${var.service_name}-staging-storage"
@@ -58,7 +58,8 @@ locals {
     local.base_frontend_common,
     var.staging_env_vars.frontend,
     {
-      "NEXT_PUBLIC_API_URL" = local.staging_backend_url
+      "NEXT_PUBLIC_API_URL"  = local.staging_backend_url
+      "NEXT_PUBLIC_SITE_URL" = local.staging_frontend_url
     }
   )
 }
@@ -109,7 +110,6 @@ module "staging_deployment" {
   frontend_env_vars = local.staging_frontend_env_vars
 }
 
-# COMMENTED: Production deployment not needed for staging-only deployment
 # module "production_deployment" {
 #   source = "../modules/deployment_stack"
 #
