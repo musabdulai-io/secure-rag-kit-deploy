@@ -99,7 +99,7 @@ module "staging_deployment" {
       "ALLOWED_ORIGINS" = join(",", compact([local.staging_frontend_url, lookup(var.staging_env_vars.backend, "ALLOWED_ORIGINS", "")]))
       "FRONTEND_URL"    = local.staging_frontend_url
       "API_BASE_URL"    = local.staging_backend_url
-      "STORAGE_BUCKET"  = local.staging_storage_bucket_name
+      "GCS_BUCKET_NAME" = local.staging_storage_bucket_name
       # REMOVED: Cloud Tasks not needed
       # "CLOUD_TASKS_LOCATION"   = var.region
       # "CLOUD_TASKS_QUEUE_NAME" = local.staging_cloud_tasks_queue_name
