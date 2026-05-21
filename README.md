@@ -2,7 +2,6 @@
 
 Terraform + Cloud Build deployment infrastructure for [`secure-rag-kit`](https://github.com/musabdulai-io/secure-rag-kit). Deploys to Google Cloud Run.
 
-**Live deployment**: [rag.musabdulai.com](https://rag.musabdulai.com)
 
 ## Layout
 
