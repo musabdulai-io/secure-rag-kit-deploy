@@ -16,3 +16,6 @@
 .vscode/
 *.swp
 *.swo
+
+# Terraform values with real secrets — keep local only; use terraform.example.tfvars as template
+**/terraform.tfvars
